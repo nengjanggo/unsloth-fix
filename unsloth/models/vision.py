@@ -28,7 +28,7 @@ pass
 from ..kernels import (
     post_patch_loss_function,
 )
-from ._utils import __version__, importlib_version
+from ._utils import __version__, importlib_version, _prepare_model_for_qat
 from ._utils import *
 from ..save import patch_saving_functions
 from peft import LoraConfig, TaskType, get_peft_model as _get_peft_model
@@ -71,7 +71,14 @@ except:
     # Old HF Hub versions <= 0.0.25
     from huggingface_hub.utils._token import get_token
 pass
-from unsloth import DEVICE_TYPE, DEVICE_COUNT
+from ..device_type import (
+    is_hip,
+    get_device_type,
+    DEVICE_TYPE,
+    DEVICE_TYPE_TORCH,
+    DEVICE_COUNT,
+    ALLOW_PREQUANTIZED_MODELS,
+)
 
 __all__ = [
     "FastBaseModel",
@@ -92,7 +99,13 @@ PRE_COMPILE_INFERENCE = [
     "gpt_oss",
 ]
 
-from transformers import GenerationConfig, CompileConfig, HybridCache, AutoConfig, PretrainedConfig
+from transformers import GenerationConfig, CompileConfig, HybridCache, AutoConfig
+try:
+    from transformers import PreTrainedConfig
+    PretrainedConfig = PreTrainedConfig
+except:
+    from transformers import PretrainedConfig
+
 HAS_TORCH_DTYPE = "torch_dtype" in PretrainedConfig.__doc__
 
 from transformers import GenerationConfig, CompileConfig, HybridCache
@@ -143,6 +156,9 @@ def unsloth_base_fast_generate(
 
     FastBaseModel.for_inference(self)
     dtype = _get_dtype(dtype_from_config(self.config))
+    # Handle full float32 cases as config.dtype == torch.float32!
+    do_bfloat16_mixed_precision = os.environ.get("UNSLOTH_BFLOAT16_MIXED_PRECISION", "0") == "1"
+    if do_bfloat16_mixed_precision: dtype = torch.bfloat16
 
     # Check if VLM
     is_vlm = any(
@@ -198,11 +214,10 @@ def unsloth_base_fast_generate(
 
     # Mixed precision autocast
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-        autocaster = torch.autocast(device_type = "cuda", dtype = torch.float16)
+        autocaster = torch.autocast(device_type = DEVICE_TYPE_TORCH, dtype = torch.float16)
         dtype = torch.float16
     else:
-        autocaster = torch.autocast(device_type = "cuda", dtype = dtype)
-
+        autocaster = torch.autocast(device_type = DEVICE_TYPE_TORCH, dtype = dtype)
     # Prepare LoRA
     # state_dict = convert_lora_modules(self, dtype = dtype)
 
@@ -239,6 +254,8 @@ def unsloth_base_fast_generate(
                 cache_implementation = "hybrid"
             else:
                 cache_implementation = "static"
+    # [TODO] Unsure why static fails
+    if do_bfloat16_mixed_precision: cache_implementation = None
 
     if "generation_config" in kwargs:
         kwargs["generation_config"].cache_implementation = cache_implementation
@@ -303,6 +320,7 @@ class FastBaseModel:
         whisper_task      = None,
         auto_config       = None,
         offload_embedding = False,
+        float32_mixed_precision = None, # Forces float32 mixed precision
         # vLLM parameters
         fast_inference    = False,
         gpu_memory_utilization = 0.5,
@@ -361,21 +379,24 @@ class FastBaseModel:
 
         if DEVICE_TYPE == "cuda":
             gpu_stats = torch.cuda.get_device_properties(0)
+            gpu_stats_name = gpu_stats.name + ". " if gpu_stats.name != "" else "NVIDIA GPU Device. "
             gpu_version = torch.version.cuda
             gpu_stats_snippet = f"CUDA: {gpu_stats.major}.{gpu_stats.minor}. CUDA Toolkit: {gpu_version}."
             try:    vllm_version = f" vLLM: {importlib_version('vllm')}."
             except: vllm_version = ""
         elif DEVICE_TYPE == "hip":
             gpu_stats = torch.cuda.get_device_properties(0)
+            gpu_stats_name = gpu_stats.name + ". " if gpu_stats.name != "" else "AMD GPU Device. "
             gpu_version = torch.version.hip
             gpu_stats_snippet = f"ROCm Toolkit: {gpu_version}."
             try:    vllm_version = f" vLLM: {importlib_version('vllm')}."
             except: vllm_version = ""
         elif DEVICE_TYPE == "xpu":
             gpu_stats = torch.xpu.get_device_properties(0)
+            gpu_stats_name = gpu_stats.name + ". " if gpu_stats.name != "" else "Intel XPU Device. "
             gpu_version = torch.version.xpu
             gpu_stats_snippet = f"Intel Toolkit: {gpu_version}."
-            # TODO: After adding vLLM support for XPU, changed this
+            # [TODO] After adding vLLM support for XPU, change this
             vllm_version = ""
         else:
             raise ValueError(f"Unsloth: Unsupported device type: {DEVICE_TYPE}")
@@ -384,7 +405,7 @@ class FastBaseModel:
 
         statistics = \
         f"==((====))==  Unsloth {__version__}: Fast {model_type_arch.title()} patching. Transformers: {transformers_version}.{vllm_version}\n"\
-        f"   {chr(92)}{chr(92)}   /|    {gpu_stats.name}. Num GPUs = {DEVICE_COUNT}. Max memory: {max_memory} GB. Platform: {platform_system}.\n"\
+        f"   {chr(92)}{chr(92)}   /|    {gpu_stats_name}Num GPUs = {DEVICE_COUNT}. Max memory: {max_memory} GB. Platform: {platform_system}.\n"\
         f"O^O/ {chr(92)}_/ {chr(92)}    Torch: {torch.__version__}. {gpu_stats_snippet} Triton: {triton_version}\n"\
         f"{chr(92)}        /    Bfloat16 = {str(SUPPORTS_BFLOAT16).upper()}. FA [Xformers = {xformers_version}. FA2 = {HAS_FLASH_ATTENTION}]\n"\
         f' "-____-"     Free license: http://github.com/unslothai/unsloth'
@@ -403,7 +424,8 @@ class FastBaseModel:
         pass
         if old_hf_transfer != "0": os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-        get_statistics() # For debugging - we use a download counter to see if environments are not breaking
+        # For debugging - we use a download counter to see if environments are not breaking or if HF is down
+        get_statistics(kwargs.get("local_files_only", False))
 
         if dtype is None:
             dtype = torch.float16 if not SUPPORTS_BFLOAT16 else torch.bfloat16
@@ -493,7 +515,18 @@ class FastBaseModel:
         if full_finetuning:
             os.environ["UNSLOTH_ENABLE_FULL_FINETUNING"] = "1"
             if dtype == torch.bfloat16:
-                print("Unsloth: Using bfloat16 full finetuning which cuts memory usage by 50%.")
+                if float32_mixed_precision != True:
+                    print(
+                        f"Unsloth: Using bfloat16 full finetuning which cuts memory usage by 50%.\n"
+                        f"To enable float32 training, use `float32_mixed_precision = True` during FastLanguageModel.from_pretrained"
+                    )
+                else:
+                    print(
+                        f"Unsloth: Using full float32 full finetuning. "
+                        f"To enable bfloat16 training to reduce VRAM usage by 50% albeit with a slightly higher loss, do:\n"\
+                        "use `float32_mixed_precision = False` during FastLanguageModel.from_pretrained"
+                    )
+                    os.environ["UNSLOTH_BFLOAT16_MIXED_PRECISION"] = "1"
             else:
                 print("Unsloth: Float16 full finetuning uses more memory since we upcast weights to float32.")
         else:
@@ -521,11 +554,18 @@ class FastBaseModel:
             if hasattr(auto_config, "quantization_config"):
                 from transformers.quantizers.auto import AUTO_QUANTIZATION_CONFIG_MAPPING
                 quantization_config = auto_config.quantization_config
-                quantizer = AUTO_QUANTIZATION_CONFIG_MAPPING[quantization_config["quant_method"]]
+                quant_method = quantization_config["quant_method"]
+                # Sometimes bitsandbytes_4bit + bitsandbytes_8bit is provided
+                if quant_method == "bitsandbytes" and "bitsandbytes" not in AUTO_QUANTIZATION_CONFIG_MAPPING:
+                    if "bitsandbytes_4bit" not in AUTO_QUANTIZATION_CONFIG_MAPPING:
+                        raise KeyError("Unsloth: AUTO_QUANTIZATION_CONFIG_MAPPING does not have `bitsandbytes_4bit`")
+                    quantizer = AUTO_QUANTIZATION_CONFIG_MAPPING["bitsandbytes_4bit"]
+                else:
+                    quantizer = AUTO_QUANTIZATION_CONFIG_MAPPING[quant_method]
                 quantizer_kwargs = {}
                 # We cannot dequantize since gpt-oss-20b MXFP4 will now be gpt-oss-20b-BF16
-                # if "dequantize" in inspect.signature(quantizer).parameters:
-                #     quantizer_kwargs["dequantize"] = True
+                if load_in_16bit and "dequantize" in inspect.signature(quantizer).parameters:
+                    quantizer_kwargs["dequantize"] = True
                 quantization_config = quantizer.from_dict(quantization_config, **quantizer_kwargs)
                 kwargs["quantization_config"] = quantization_config
             pass
@@ -549,7 +589,7 @@ class FastBaseModel:
                 # attn_implementation   = attn_implementation,
                 **kwargs,
             )
-            if hasattr(model, 'generate'):
+            if hasattr(model, "generate"):
                 model.fast_generate = model.generate
                 model.fast_generate_batches = error_out_no_vllm
             if offload_embedding:
@@ -584,6 +624,7 @@ class FastBaseModel:
                 token = token,
                 attn_implementation = "sdpa" if supports_sdpa else "eager",
             )
+            model_config.model_name = model_name
 
             if fast_inference:
                 fast_inference, model_name = fast_inference_setup(model_name, model_config)
@@ -612,8 +653,17 @@ class FastBaseModel:
             llm = load_vllm(**load_vllm_kwargs)
 
             # Convert to HF format
-            _, quant_state_dict = get_vllm_state_dict(llm, config = model_config, is_vision_model = True)
-            model = convert_vllm_to_huggingface(quant_state_dict, model_config, dtype, bnb_config, is_vision_model = True)
+            _, quant_state_dict = get_vllm_state_dict(
+                llm,
+                config = model_config,
+                is_vision_model = is_vlm,
+            )
+            model = convert_vllm_to_huggingface(
+                quant_state_dict,
+                model_config,
+                dtype, bnb_config,
+                is_vision_model = is_vlm,
+            )
             model.vllm_engine = llm
             model.fast_generate = model.vllm_engine.generate
             model.fast_generate_batches = functools.partial(generate_batches, model.vllm_engine)
@@ -627,7 +677,9 @@ class FastBaseModel:
         # Check float32 norm weights
         if os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1":
             for jj, (name, module) in enumerate(model.named_modules()):
-                if name.endswith("norm") and hasattr(module, "weight"):
+                if (name.endswith(("norm", "norm1", "norm2", "norm3", "norm4")) \
+                    or "layernorm" in name or "layer_norm" in name) \
+                    and hasattr(module, "weight"):
                     module._pre_set_compute_dtype = torch.float32
         pass
         # Edit data-types
@@ -700,6 +752,9 @@ class FastBaseModel:
             model.config.update({"unsloth_version" : __version__})
         pass
         patch_saving_functions(model, vision = True)
+        if tokenizer is None:
+            del model
+            raise RuntimeError("Unsloth: The tokenizer is weirdly not loaded? Please check if there is one.")
         patch_saving_functions(tokenizer, vision = True)
 
         # Fix gradient accumulation
@@ -741,6 +796,7 @@ class FastBaseModel:
             trust_remote_code  = trust_remote_code,
             model_type = model_type_arch,
             tokenizer = tokenizer,
+            float32_mixed_precision = float32_mixed_precision,
         )
         # Clear deleted GPU items
         for _ in range(3):
@@ -751,52 +807,6 @@ class FastBaseModel:
                 torch.xpu.empty_cache()
         pass
         return model, tokenizer
-    pass
-
-    @staticmethod
-    def pre_compile_for_inference(model_type, model, tokenizer):
-        """
-        We need to invoke torch.compile to save VRAM usage and make it faster downstream.
-        Sometimes torch.compile can use 3GB weirdly on large batches, then it goes down to <1GB.
-        So we invoke torch.compile on short batches to reduce VRAM usage.
-        """
-        if model_type is None or model is None or tokenizer is None: return
-        if str(model_type).lower() not in PRE_COMPILE_INFERENCE: return
-        if getattr(tokenizer, "chat_template", None) is None: return
-        # Check if already compiled and exit
-        for module in model.modules():
-            if hasattr(module, "_pre_compiled_for_inference"): return
-        pass
-        print(f"🦥 Unsloth: Pre compiling {model_type.title()} model for faster inference - this might take 3 minutes or so!")
-        print("========= Pre compiling model for faster inference. Please be patient thank you! =========")
-        # Do single inference
-        messages = [
-            [
-                 {"role": "user", "content": f"What is 1+1 equal to?"},
-            ],
-        ]*1
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt = True,
-            return_tensors = "pt",
-            return_dict = True,
-        ).to(model.device)
-        _ = model.generate(**inputs, max_new_tokens = 1)
-        # Do batched inference
-        messages = [
-            [
-                 {"role": "user", "content": f"1+1"},
-            ],
-        ]*4
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt = True,
-            return_tensors = "pt",
-            return_dict = True,
-        ).to(model.device)
-        _ = model.generate(**inputs, max_new_tokens = 2)
-        # Set we already pre compiled
-        model._pre_compiled_for_inference = True
     pass
 
     @staticmethod
@@ -822,6 +832,7 @@ class FastBaseModel:
         loftq_config               = {},
         task_type                  = TaskType.CAUSAL_LM,
         temporary_location         = "_unsloth_temporary_saved_buffers",
+        qat_scheme                 = None,
         **kwargs
     ):
         if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
@@ -897,12 +908,21 @@ class FastBaseModel:
             use_gradient_checkpointing = use_gradient_checkpointing,
         )
         model = _get_peft_model(model, lora_config)
+        # Apply QAT + LoRA if specified
+        if qat_scheme is not None:
+            print("Unsloth: Applying QAT to mitigate quantization degradation")
+            model = _prepare_model_for_qat(model, qat_scheme)
+        pass
         # Fix LoraConfig.auto_mapping is None
         fix_lora_auto_mapping(model)
         # Enable gradients on modules which are trainable
         requires_grad_for_gradient_checkpointing(model)
         trust_remote_code = getattr(model, "_unsloth_trust_remote_code", False)
-        model = FastBaseModel.post_patch_model(model, use_gradient_checkpointing, trust_remote_code = trust_remote_code)
+        model = FastBaseModel.post_patch_model(
+            model,
+            use_gradient_checkpointing = use_gradient_checkpointing,
+            trust_remote_code = trust_remote_code,
+        )
         model.max_seq_length = max_seq_length
         # Save to modules as well
         for module in model.modules():
@@ -937,13 +957,18 @@ class FastBaseModel:
         trust_remote_code = False,
         model_type = None,
         tokenizer = None,
+        float32_mixed_precision = None,
     ):
         full_finetuning = os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1"
 
-        float32_mixed_precision = True
-        if _get_dtype(dtype_from_config(model.config)) == torch.bfloat16 and full_finetuning:
-            # Use bfloat16 precision for full finetuning
-            float32_mixed_precision = False
+        if type(float32_mixed_precision) is bool:
+            # Respect whatever it was set before
+            pass
+        else:
+            float32_mixed_precision = True
+            if _get_dtype(dtype_from_config(model.config)) == torch.bfloat16 and full_finetuning:
+                # Use bfloat16 precision for full finetuning
+                float32_mixed_precision = False
 
         model = prepare_model_for_training(
             model,
@@ -998,14 +1023,15 @@ class FastBaseModel:
             m.for_inference = functools.partial(FastBaseModel.for_inference, m)
             m = m.model
         # Set weight[padding_idx] = 0
-        with torch.no_grad():
-            for name, module in model.named_modules():
-                if type(module) is torch.nn.Embedding:
-                    if getattr(module, "weight", None) is not None and getattr(module, "padding_idx", None) is not None:
-                        if module.padding_idx < module.weight.shape[0]:
-                            module.weight[module.padding_idx] = 0
-        # Patch for torch.compiled inference
-        # FastBaseModel.pre_compile_for_inference(model_type, model, tokenizer)
+        # Only do this if tokenizer is defined since eos_token == pad_token sometimes!
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if tokenizer is not None and getattr(tokenizer, "eos_token_id", None) != pad_token_id:
+            with torch.no_grad():
+                for name, module in model.named_modules():
+                    if type(module) is torch.nn.Embedding:
+                        if getattr(module, "weight", None) is not None and getattr(module, "padding_idx", None) is not None:
+                            if module.padding_idx == pad_token_id and module.padding_idx < module.weight.shape[0]:
+                                module.weight[module.padding_idx] = 0
         return model
     pass
 
