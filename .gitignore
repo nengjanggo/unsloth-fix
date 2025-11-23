@@ -175,3 +175,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .vscode
+
+grpo_trainer_lora_model/
+wandb/
+output/
