@@ -275,6 +275,8 @@ def grpo_compute_loss(
             if temperature != 1.0: old_logits = old_logits / temperature
             old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
             old = old_x - torch.logsumexp(old_logits, dim = -1)
+
+            old_ppl = torch.exp(-(old * mask).sum(-1) / mask.sum())
         pass
         if use_vllm and sampling_per_token_logps is not None:
             #must filter out extra prompt tokens in begining after making input_ids left padded
@@ -397,7 +399,8 @@ def grpo_compute_loss(
     custom_metrics = {
         'planning_per_token_entropy': planning_per_token_entropy,
         'execution_per_token_entropy': execution_per_token_entropy,
-        'normalized_execution_per_token_entropy': normalized_execution_per_token_entropy
+        'normalized_execution_per_token_entropy': normalized_execution_per_token_entropy,
+        'old_ppl': old_ppl
     }
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio, custom_metrics
@@ -483,6 +486,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_planning_per_token_entropy = torch.zeros(1, device = device)
         accumulated_execution_per_token_entropy = torch.zeros(1, device = device)
         accumulated_normalized_execution_per_token_entropy = torch.zeros(1, device = device)
+        accumulated_old_ppl = torch.zeros(1, device = device)
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
         def accumulate_chunk(
@@ -510,9 +514,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             chunk_planning_per_token_entropy = chunk_custom_metrics['planning_per_token_entropy']
             chunk_execution_per_token_entropy = chunk_custom_metrics['execution_per_token_entropy']
             chunk_normalized_execution_per_token_entropy = chunk_custom_metrics['normalized_execution_per_token_entropy']
+            chunk_old_ppl = chunk_custom_metrics['old_ppl']
             accumulated_planning_per_token_entropy              .add_(chunk_planning_per_token_entropy)
             accumulated_execution_per_token_entropy             .add_(chunk_execution_per_token_entropy)
             accumulated_normalized_execution_per_token_entropy  .add_(chunk_normalized_execution_per_token_entropy)
+            accumulated_old_ppl                                 .add_(chunk_old_ppl)
             accumulated_delta            .append(chunk_delta)
             accumulated_flat_is_ratio    .append(chunk_flat_is_ratio)
             grad_inputs_j[:] = chunk_grad_input
@@ -589,6 +595,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         accumulated_planning_per_token_entropy              .div_(n_chunks)
         accumulated_execution_per_token_entropy             .div_(n_chunks)
         accumulated_normalized_execution_per_token_entropy  .div_(n_chunks)
+        accumulated_old_ppl                                  .div_(n_chunks)
 
         if _sampling_per_token_logps is not None:
             accumulated_delta = torch.cat(accumulated_delta, dim=0)
@@ -605,7 +612,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_flat_is_ratio,
             accumulated_planning_per_token_entropy,
             accumulated_execution_per_token_entropy,
-            accumulated_normalized_execution_per_token_entropy
+            accumulated_normalized_execution_per_token_entropy,
+            accumulated_old_ppl
         )
     pass
 
@@ -618,10 +626,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         ddflat_is_ratio, 
         dplanning_per_token_entropy,
         dexecution_per_token_entropy,
-        dnormalized_execution_per_token_entropy
+        dnormalized_execution_per_token_entropy,
+        dold_ppl
     ):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        return (grad_input, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     pass
 
 def grpo_accumulated_loss( # grpo_accumulated_loss -> forward -> accumulate_chunk -> compute_loss -> grpo_compute_loss
@@ -725,7 +734,7 @@ def grpo_accumulated_loss( # grpo_accumulated_loss -> forward -> accumulate_chun
         execution_token_mask = (completion_mask.bool() & (~planning_token_mask))
         execution_token_mask = execution_token_mask.to(completion_mask.dtype)
 
-    loss, completion_length, mean_kl, delta, flat_is_ratio, planning_per_token_entropy, execution_per_token_entropy, normalized_execution_per_token_entropy = UnslothEfficientGRPO.apply( # forward -> accumulate_chunk -> compute_loss -> grpo_compute_loss
+    loss, completion_length, mean_kl, delta, flat_is_ratio, planning_per_token_entropy, execution_per_token_entropy, normalized_execution_per_token_entropy, old_ppl = UnslothEfficientGRPO.apply( # forward -> accumulate_chunk -> compute_loss -> grpo_compute_loss
         new_hidden_states,
         old_hidden_states,
         ref_hidden_states,
@@ -746,7 +755,7 @@ def grpo_accumulated_loss( # grpo_accumulated_loss -> forward -> accumulate_chun
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
-    return loss, completion_length, mean_kl, delta, flat_is_ratio, planning_per_token_entropy, execution_per_token_entropy, normalized_execution_per_token_entropy, semantic_entropy
+    return loss, completion_length, mean_kl, delta, flat_is_ratio, planning_per_token_entropy, execution_per_token_entropy, normalized_execution_per_token_entropy, semantic_entropy, old_ppl
     # Old non efficient code path
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
     new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
@@ -2684,6 +2693,7 @@ class _UnslothGRPOTrainer(Trainer):
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
+            truncation_ratio = truncated_completions.sum() / truncated_completions.size(0)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
         # Concatenate prompt_mask with completion_mask for logit computation
@@ -2848,6 +2858,8 @@ class _UnslothGRPOTrainer(Trainer):
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        self._metrics[mode]["truncation_ratio"].append(truncation_ratio.item())
 
         # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
@@ -3095,7 +3107,7 @@ class _UnslothGRPOTrainer(Trainer):
             )
         else:
             if hasattr(self.args, "loss_type"):
-                loss, completion_length, mean_kl, delta, flat_is_ratio, planning_per_token_entropy, execution_per_token_entropy, normalized_execution_per_token_entropy, semantic_entropy = (
+                loss, completion_length, mean_kl, delta, flat_is_ratio, planning_per_token_entropy, execution_per_token_entropy, normalized_execution_per_token_entropy, semantic_entropy, old_ppl = (
                     grpo_accumulated_loss(
                         trainer = self,
                         input_ids = _input_ids,
@@ -3150,6 +3162,7 @@ class _UnslothGRPOTrainer(Trainer):
             self._metrics[mode]["execution_per_token_entropy"].append(execution_per_token_entropy.item())
             self._metrics[mode]["normalized_execution_per_token_entropy"].append(normalized_execution_per_token_entropy.item())
             self._metrics[mode]["semantic_entropy"].append(semantic_entropy.item())
+            self._metrics[mode]["perplexity"].append(old_ppl.item())
         else:
             self._metrics["completion_length"].append(completion_length.item())
             self._metrics["kl"].append(mean_kl.item())
@@ -3157,6 +3170,7 @@ class _UnslothGRPOTrainer(Trainer):
             self._metrics["execution_per_token_entropy"].append(execution_per_token_entropy.item())
             self._metrics["normalized_execution_per_token_entropy"].append(normalized_execution_per_token_entropy.item())
             self._metrics["semantic_entropy"].append(semantic_entropy.item())
+            self._metrics["perplexity"].append(old_ppl.item())
 
         if self.use_vllm and delta is not None:
             mean_delta = (
