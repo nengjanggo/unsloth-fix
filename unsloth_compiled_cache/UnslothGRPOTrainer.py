@@ -47,7 +47,7 @@ import functools
 from types import MethodType
 
 import wandb
-from unsloth.config import execution_token_entropy_coef, advantage_schedule, execution_token_entropy_schedule_ceil, execution_token_entropy_schedule_ratio, initial_normalized_execution_token_entropy
+from unsloth.config import execution_token_entropy_coef, execution_token_entropy_clamp_min, advantage_schedule, execution_token_entropy_schedule_ceil, execution_token_entropy_schedule_ratio, initial_normalized_execution_token_entropy
 def prepare_for_training_mode(f):
     @functools.wraps(f)
     def wrapper(self, *args, **kwargs):
@@ -378,7 +378,7 @@ def grpo_compute_loss(
     else: 
         raise ValueError(f"Unknown loss type: {loss_type}")
 
-    loss += execution_token_entropy_coef * normalized_execution_per_token_entropy.squeeze()
+    loss += execution_token_entropy_coef * torch.clamp(normalized_execution_per_token_entropy.squeeze(), min=execution_token_entropy_clamp_min)
 
     # loss = (loss_i * mask).sum() / mask.sum()
 
