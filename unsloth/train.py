@@ -52,7 +52,7 @@ def main():
         scale_rewards='group',
         loss_type='dapo',
         mask_truncated_completions=True,
-        log_completions='rich',
+        # log_completions='rich',
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
