@@ -31,12 +31,13 @@ per_device_eval_batch_size = 64
 eval_steps = 0.1 * max_steps
 eval_on_start = False
 
-execution_token_entropy_coef = 0.0
+execution_token_entropy_coef = 0.0025
+execution_token_entropy_clamp_min = 0.020
 # advantage_schedule = 'none'
 advantage_schedule = 'hicra'
 # advantage_schedule = 'execution_token_entropy'
 execution_token_entropy_schedule_ceil = 0.4
-execution_token_entropy_schedule_ratio = 0.8
+execution_token_entropy_schedule_ratio = 0.6
 initial_normalized_execution_token_entropy = 0.02
 
 
