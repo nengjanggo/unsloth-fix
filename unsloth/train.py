@@ -28,6 +28,9 @@ def main():
         max_lora_rank=lora_rank
     )
 
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = chat_template
+
     model = FastLanguageModel.get_peft_model(
         model,
         r = lora_rank,
@@ -51,8 +54,8 @@ def main():
         epsilon_high=0.28,
         scale_rewards='group',
         loss_type='dapo',
-        mask_truncated_completions=True,
-        # log_completions='rich',
+        mask_truncated_completions=mask_truncated_completions,
+        log_completions=log_completions,
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -86,7 +89,7 @@ def main():
     else:
         trainer.train(resume_from_checkpoint=False)
 
-    model.save_pretrained_merged(output_dir, tokenizer, save_method='merged_16bit')
+    # model.save_pretrained_merged(output_dir, tokenizer, save_method='merged_16bit')
 
 
 if __name__ == '__main__':
