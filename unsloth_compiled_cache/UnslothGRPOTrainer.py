@@ -47,7 +47,16 @@ import functools
 from types import MethodType
 
 import wandb
-from unsloth.config import execution_token_entropy_coef, execution_token_entropy_clamp_min, advantage_schedule, execution_token_entropy_schedule_ceil, execution_token_entropy_schedule_ratio, initial_normalized_execution_token_entropy
+from unsloth.config import (
+    execution_token_entropy_coef, 
+    execution_token_entropy_clamp_min, 
+    planning_token_entropy_coef, 
+    planning_token_entropy_clamp_max, 
+    advantage_schedule, 
+    execution_token_entropy_schedule_ceil, 
+    execution_token_entropy_schedule_ratio, 
+    initial_normalized_execution_token_entropy
+)
 def prepare_for_training_mode(f):
     @functools.wraps(f)
     def wrapper(self, *args, **kwargs):
@@ -246,6 +255,7 @@ def grpo_compute_loss(
         max_per_token_entropy = torch.log(torch.tensor(vocab_size, device=execution_per_token_entropy.device, dtype=execution_per_token_entropy.dtype)) # (1)
 
         normalized_execution_per_token_entropy = (execution_per_token_entropy / max_per_token_entropy).clamp(0, 1) # (1)
+        normalized_planning_per_token_entropy = (planning_per_token_entropy / max_per_token_entropy).clamp(0, 1) # (1)
 
     # x_i - logsumexp(x_i)
     with torch.no_grad():
@@ -381,6 +391,7 @@ def grpo_compute_loss(
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     loss += execution_token_entropy_coef * torch.clamp(normalized_execution_per_token_entropy.squeeze(), min=execution_token_entropy_clamp_min)
+    loss -= planning_token_entropy_coef * torch.clamp(normalized_planning_per_token_entropy.squeeze(), max=planning_token_entropy_clamp_max)
 
     # loss = (loss_i * mask).sum() / mask.sum()
 
@@ -1397,15 +1408,15 @@ class UnslothGRPOConfig(GRPOConfig):
             elif scale_rewards == True:
                 print('Unsloth: The Dr GRPO paper recommends setting `scale_rewards` to False! Will override. Set it to `None` to force False.')
                 scale_rewards = False
-        elif loss_type.lower() == 'dapo':
-            if mask_truncated_completions != True:
-                print('Unsloth: The DAPO paper recommends `mask_truncated_completions = True` - we will set it.')
-            if epsilon_high != 0.28:
-                print('Unsloth: The DAPO paper recommends `epsilon_high = 0.28` - we will set it.')
-            if beta != 0.0:
-                print(f'[WARNING] Unsloth: The DAPO paper recommends setting `beta = 0.0` to remove the KL term - You have set it to {beta}.')
-            mask_truncated_completions = True
-            epsilon_high = 0.28
+        # elif loss_type.lower() == 'dapo':
+        #     if mask_truncated_completions != True:
+        #         print('Unsloth: The DAPO paper recommends `mask_truncated_completions = True` - we will set it.')
+        #     if epsilon_high != 0.28:
+        #         print('Unsloth: The DAPO paper recommends `epsilon_high = 0.28` - we will set it.')
+        #     if beta != 0.0:
+        #         print(f'[WARNING] Unsloth: The DAPO paper recommends setting `beta = 0.0` to remove the KL term - You have set it to {beta}.')
+        #     mask_truncated_completions = True
+        #     epsilon_high = 0.28
         
         if steps_per_generation is None and generation_batch_size is None:
             ga = gradient_accumulation_steps
@@ -2693,7 +2704,7 @@ class _UnslothGRPOTrainer(Trainer):
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
-            truncation_ratio = truncated_completions.sum() / truncated_completions.size(0)
+            # truncation_ratio = truncated_completions.sum() / truncated_completions.size(0)
             completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
         # Concatenate prompt_mask with completion_mask for logit computation
@@ -2859,7 +2870,7 @@ class _UnslothGRPOTrainer(Trainer):
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
-        self._metrics[mode]["truncation_ratio"].append(truncation_ratio.item())
+        # self._metrics[mode]["truncation_ratio"].append(truncation_ratio.item())
 
         # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
